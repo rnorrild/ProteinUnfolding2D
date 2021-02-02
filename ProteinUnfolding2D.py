@@ -515,6 +515,404 @@ class NanoDsfParser:
         return(len(self.__sample_map))
 
     
+
+class NanoDsfPantaParser:
+    """Read and slice NanoDSF data files containing a number of sheets with measured curves for a number of
+    samples (capilaries).
+
+    Class variables
+    ----------
+    __supported_curves_sheetname : dict
+        These are the supported curves and associated sheet names. The keys are the curve labels used to retrive 
+        data from this class.
+    """
+
+    # Use lower case only
+    __supported_curves_sheetname = {'I330':['330nm','330nm (unfolding)'], 'I350':['350nm','350nm (unfolding)'],
+                                    'I330_REFOLD':['330nm (refolding)'], 'I350_REFOLD':['350nm (refolding)']}
+
+    def __init__(self, *datafiles):
+        """Constructor
+
+        Parameters
+        ----------
+        **datafiles : str, optional
+             Any number of data file names to load upon construction
+        """
+        self.__filenames = []  # List of names per loaded file
+        self.__raw_temp = []   # List of temperature nd.array per file
+        self.__raw_curves = [] # List of curve dicts per file. A curve dict has a element per supported curve each
+                               #   containing an nd.array of the same length as the temperature array for that file
+        self.__sample_map = [] # List of sample dicts per loaded sample. A sample dict contains a pointer to the
+                               #   relevant temperature and curve arrays in the raw lists.
+
+        for datafile in datafiles:
+            self.load(datafile)
+            
+    def __get_temp_serie(self, book, label, capilary_ids, refolding=False, verbose=1):
+        """Get the temperature serie from a workbook
+    
+        A temperature curve is given for each data series, and the function retreives them all
+        by looking at the excel-sheet containing the data and finding all columns
+        with (case-insensitive substring) \'temperature\'. Within this set, it will find
+        all columns with or without (case-insensitive substring) \'refolding\' depending
+        on the refolding parameter passed.
+        
+        For each capilary in the capilary_ids passed, the function checks that all
+        temperature series found are identical and adds it to the exported dictionary.
+        Each capilary thus has its own temperature series to account for significant
+        measurement delay when DLS is active
+        
+        Parameters
+        ----------
+        book : xlrd.Book object
+             Book to read
+        label : str
+             Label of the data to be retrieved (e.g. 'I350_REFOLD')
+        capilary_ids : list
+             List of capilary identifier integers to look for in the sheet top row
+        refolding : bool, optional
+             Return refolding data or not
+        verbose : int, optional
+             Level of information dumped. Zero is warnings and errors only
+        """
+        
+
+        # Loop through the capillaries id and construct a dict of the data 
+        temp_series = {}
+        len_refold_data = None
+        
+        for capilary_id in capilary_ids:
+            data_cols = [] # To contain all columns with capillary id 
+            
+            # Loop over names of columns
+            for i, col in enumerate(book.sheet_by_name(data_sheetname).row(0)):
+                
+                # Find columns for the capillary id
+                if '.'+str(capilary_id)+' ' in col.value and 'temperature' in col.value.lower():
+                    
+                    # Check for refolding or not
+                    if (refolding and 'refolding' in col.value.lower() or
+                        not refolding and not 'refolding' in col.value.lower()):
+
+                        raw_column = book.sheet_by_name(data_sheetname).col(i)[1:]
+                        data_cols.append(np.array([float(cell.value) for cell in raw_column 
+                                                   if not cell.value == ''])) # Condition to catch empty cells. This happens in there are fewer datapoints in the refolding.
+
+            # Check if all time series are identical and add the data to the dictionary
+            if not (np.std(np.array(data_cols), axis = 0) == np.zeros(len(data_cols[0]))).all():
+                print('ERROR: Not all temperature columns are identical for capillary {}.'.format(capilary_id))
+
+            temp_series[capilary_id] = data_cols[0]
+            
+        return(temp_series)        
+
+    def __get_intensity_serie(self, book, label, capilary_ids, refolding=False, verbose=1):
+        """Get the fluorescence intensity series from a sheet
+    
+        Given a workbook, a label for the kind of data to be retreived, and a list
+        of the capillary ids to extract data from, the function returns a dictionary
+        with the ids as keys and np.arrays as values.
+        
+        The function looks for all columns containing the each capilary id in the form
+        of (case-insensitive substring) \'.1 \' for capilary 1.
+        
+        Parameters
+        ----------
+        book : xlrd.Book object
+            Book to read
+        label : str
+            The label for the datatype 
+        capilary_ids : list of int
+            List of capilary identifier integers to look for in the sheet top row
+        refolding : bool, optional
+            Return refolding data or not
+        verbose : int, optional
+            Level of information dumped. Zero is warnings and errors only
+        """
+        
+        # Assign variables for choosing the right columns depending on refolding
+        if refolding:
+            label_dict = {'I330':9,
+                          'I330_REFOLD':11,
+                          'I350':5,
+                          'I350_REFOLD':7}
+            columns_pr_cap = 12
+        elif not refolding:
+            label_dict = {'I330':5,
+                          'I350':3}
+            columns_pr_cap = 6
+        
+        # Loop through the capillaries id and construct a dict of the data 
+        curve_series = {}
+        
+        for capilary_id in capilary_ids:
+            data_cols = [] # To contain all columns with capillary id 
+            # Loop over names of columns
+            for i, col in enumerate(book.sheet_by_name(data_sheetname).row(0)):
+                if '.'+str(capilary_id)+' ' in col.value:
+                    data_cols.append(book.sheet_by_name(data_sheetname).col(i)[1:])
+            
+            # Choose the data from the data_cols based on the label_dict
+            col = data_cols[label_dict[label]]
+            curve_series[capilary_id] = np.array([float(cell.value) for cell in col
+                                                  if not cell.value == '']) # Condition to catch empty cells. This happens in there are fewer datapoints in the refolding.
+        
+        return(curve_series)
+    
+    def load(self, filename, verbose=1):
+        """Load a NanoDSF excel file
+
+        Parameters
+        ----------
+        filename : str
+             File to read
+        verbose : int, optional
+             Level of information dumped. Zero is warnings and errors only
+        """
+        this_filename_index = len(self.__filenames)
+        try:
+            # This is slow and the on_demans argument has, unfortunately, no effect on xlsx files
+            book = xlrd.open_workbook(filename, on_demand=True)
+        except:
+            print("ERROR: Could not open file \'%s\'" % (filename))
+            return None
+        
+        # Find sheet names depending on experiment settings
+        global overview_sheetname
+        global data_sheetname
+
+        overview_sheetname = None
+        data_sheetname = None
+        for sheetname in book.sheet_names():
+            # Sheet containing overview and denaturant concentrations
+            if sheetname.strip().lower() in ["overview"]:
+                if not overview_sheetname is None:
+                    print("WARNING: Ignoring multiple occurences of sheet name %s in %s, using first match" % (sheetname,filename))
+                else:
+                    overview_sheetname = sheetname
+                continue
+            
+            # Sheet containing measured fluorescence of unfolding
+            if sheetname.strip().lower() in ['data export']:
+                if not data_sheetname is None:
+                    print("WARNING: Ignoring multiple occurences of sheet name %s in %s, using first match" % (sheetname,filename))
+                else:
+                    data_sheetname = sheetname
+                continue
+
+        # Check if all sheets were found
+        if overview_sheetname is None:
+            print("ERROR: Could not find overview sheets in %s" % (filename))
+            return(None)
+
+        # Read capilary id's from overview sheet
+        capilary_ids = []
+        for cell in book.sheet_by_name(overview_sheetname).col_slice(0,1):
+            if cell.ctype == 2: # must be XL_CELL_NUMBER (value is float)
+                capilary_ids.append(int(cell.value))
+            else:
+                break
+        if len(capilary_ids) < 1:
+            print("ERROR: Could not find any measured capilaries in sheet %s of file %s" % (overview_sheetname,filename))
+            return(None)
+        elif len(set(capilary_ids)) < len(capilary_ids):
+            print("ERROR: Capilary list in sheet \'%s\' of file %s is redundant" % (overview_sheetname,filename))
+            return(None)
+        
+        # Read denaturent concentrations from overview sheet
+        col_name_cells = book.sheet_by_name(overview_sheetname).row(0)
+        denat_col_index = None
+        for ci in range(len(col_name_cells)):
+            if any( [denat_string in (col_name_cells[ci]).value.lower() for denat_string in ["guhcl","denat","denaturent","denaturant"]] ):
+                if not denat_col_index is None:
+                    print("ERROR: Multiple columns in the overview sheet of %s match a denaturent column, at least col %d and %d" % (filename,denat_col_index,ci))
+                    return(None)
+                else:
+                    denat_col_index = ci
+        if denat_col_index is None:
+            print("ERROR: Could not find a denaturant column in the overview sheet of %s" % (filename))
+            return(None)
+        denat_cells = book.sheet_by_name(overview_sheetname).col_slice(denat_col_index,1,1+len(capilary_ids))
+        if not np.all([cell.ctype==2 for cell in denat_cells]):
+            print("ERROR: Not all denaturant values seems to numbers in column %d of sheet %s file %s" % (denat_col_index,overview_sheetname,filename))
+            return(None)
+        denat_val = [cell.value for cell in denat_cells]
+        denat = dict(zip(capilary_ids,denat_val))
+
+        # Check if the data contains refolding data
+        refolding = False
+        for col_name in book.sheet_by_name(data_sheetname).row(0):
+            if 'refolding' in col_name.value.lower():
+                refolding = True
+        
+        # Read intensity curves and temp series
+        curves = {}
+        temp_series = {}
+        for curve_label in self.__supported_curves_sheetname.keys():
+            if ('refold' in curve_label.lower()) and (not refolding):
+                pass
+            elif ('refold' in curve_label.lower()):
+                # Get the refolding time series and data
+                temp_series[curve_label] = self.__get_temp_serie(book, curve_label, capilary_ids, refolding=True, verbose=verbose)
+                curves[curve_label] = self.__get_intensity_serie(book, curve_label, capilary_ids, refolding, verbose)
+            else:
+                # Get the unfolding time series and data
+                temp_series[curve_label] = self.__get_temp_serie(book, curve_label, capilary_ids, refolding=False, verbose=verbose)
+                curves[curve_label] = self.__get_intensity_serie(book, curve_label, capilary_ids, refolding, verbose)
+
+        # At this point everything checks so update object variables
+        self.__filenames.append(filename)
+        self.__raw_temp.append(temp_series)
+        self.__raw_curves.append(curves)
+
+        # update __sample_map
+        for capilary_id in capilary_ids:
+            sample = {'DENAT':denat[capilary_id], 'FILE':self.__filenames[this_filename_index], 'SAMPLE':capilary_id}
+            for curve_label in self.__supported_curves_sheetname.keys():
+                if ('refold' in curve_label.lower()) and (not refolding):
+                    pass
+                else:
+                    # Two differet time series are saved for unfolding and refoling
+                    if 'refold' in curve_label.lower():
+                        sample['T_REFOLD'] = self.__raw_temp[this_filename_index][curve_label][capilary_id]
+                    else:
+                        sample['T'] = self.__raw_temp[this_filename_index][curve_label][capilary_id]
+                        
+                    sample[curve_label] = self.__raw_curves[this_filename_index][curve_label][capilary_id]
+            # If I get python right, the arrays will not be copied but only pointed to as long as they stay unchanged
+            self.__sample_map.append(sample)
+        book.release_resources()
+        del book
+        return(capilary_ids)
+
+    def get(self, indices=None, temp_min=None, temp_max=None, curve_labels=None, verbose=0):
+        """ Return a sliced copy of selected data 
+
+        Parameters
+        ----------
+        indices : iterator returning integers, optional
+             The samples to return. Default is all samples
+        temp_min, temp_max : float, optional
+             Temperature range to return. Default is all range
+        curve_labels : iterable of curve labels
+             Curves to return. Default is all curves
+        verbose : int
+             Level of information dumped. Zero is warnings and errors only
+        """
+        if curve_labels is None:
+            curve_labels = self.__supported_curves_sheetname.keys()
+        else:
+            for label in curve_labels:
+                if not label in self.__supported_curves_sheetname.keys():
+                    print("ERROR: Curve label \'%s\' not supported" % (label))
+                    return(None)
+
+        if indices is None:
+            indices = range(len(self.__sample_map))
+        else:
+            if np.min(indices) < 0 or np.max(indices) >= len(self.__sample_map):
+                print("ERROR: Data range \'%s\' is outside range 0-%d" % (str(indices),len(self.__sample_map)-1))
+                return(None)
+        
+        ret = Unfold2DData()
+        for si in indices:
+            # Number of data points for this sample
+            ndata = len(self.__sample_map[si]['T'])
+            # Determine temp_min for this sample
+            if temp_min is None:
+                Ti_begin = 0
+            else:
+                if temp_min < self.__sample_map[si]['T'][0]:
+                    print("WARNING: Tmin %.1f less than Tmin of %s capilary %d - using Tmin %.1f" %
+                          (temp_min,self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE'],self.__sample_map[si]['T'][0]))
+                    Ti_begin = 0
+                elif temp_min > self.__sample_map[si]['T'][ndata-1]:
+                    print("WARNING: Tmin %.1f greater than Tmax %.1f of %s capilary %d - discarding sample" %
+                          (temp_min, self.__sample_map[si]['T'][ndata-1], self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE']))
+                    continue
+                else:
+                    Ti_begin = np.argmin(np.abs(self.__sample_map[si]['T'] - temp_min))
+            this_temp_min = self.__sample_map[si]['T'][Ti_begin]
+            # Determine temp_max for this sample
+            if temp_max is None:
+                Ti_end = ndata
+            else:
+                if temp_max < self.__sample_map[si]['T'][0]:
+                    print("WARNING: Tmax %.1f is less than Tmin %.1f of %s capilary %d, using %.1f - discarding sample" %
+                          (temp_max, self.__sample_map[si]['T'][0], self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE']))
+                    continue
+                elif temp_max > self.__sample_map[si]['T'][ndata-1]:
+                    print("WARNING: Tmax %.1f is greater than Tmax of %s capilary %d - using Tmax %.1f" %
+                          (temp_max, self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE'], self.__sample_map[si]['T'][ndata-1]))
+                    Ti_end = ndata
+                else:
+                    Ti_end = np.argmin(np.abs(self.__sample_map[si]['T'] - temp_max))
+                # if next element is equal or only slightly larger include it
+                if ndata < (ndata-1):
+                    if self.__sample_map[si]['T'][Ti_end]-temp_max < 1e-12:
+                        Ti_end += 1
+            this_temp_max = self.__sample_map[si]['T'][Ti_end-1]
+            if Ti_begin >= Ti_end:
+                print("ERROR: Bad temperature range [%.1f,%.1f] index [%d,%d] requested for  %s capilary %d" %
+                      (this_temp_min, this_temp_max, Ti_begin, Ti_end, self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE']))
+                return(None)
+            if verbose > 0:
+                print("Temperature range [%.1f,%.1f] index [%d,%d] returned for sample index %d" %
+                      (this_temp_min, this_temp_max, Ti_begin, Ti_end, si))
+            
+            # Determine curves for this sample
+            this_curve_labels = []
+            for curve_label in curve_labels:
+                if curve_label in self.__sample_map[si].keys():
+                    this_curve_labels.append(curve_label)
+                elif verbose > 0:
+                    print("No curve with label \'%s\' in %s sample %d - skip curve in this sample" %
+                          (curve_label, self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE']))
+            if len(this_curve_labels) < 1:
+                print("No curves left in %s sample %d - skip sample" % (self.__sample_map[si]['FILE'], self.__sample_map[si]['SAMPLE']))
+                continue
+            this_sample = copy.deepcopy(self.__sample_map[si])
+            this_sample['T'] = this_sample['T'][Ti_begin:Ti_end]
+            for curve_label in self.__supported_curves_sheetname.keys():
+                if curve_label in this_curve_labels:
+                    this_sample[curve_label] = this_sample[curve_label][Ti_begin:Ti_end]
+                elif curve_label in this_sample:
+                    del this_sample[curve_label]
+            ret.append(this_sample)
+        return(ret)
+
+    def get_curve_labels(self, sample_list=None):
+        """Get list of curve_labels used in a list of samples or in all loaded data
+
+        Parameters
+        ----------
+        sample_list : Unfold2DData
+        """
+        if sample_list is None:
+            sample_list = self.__sample_map
+        label_set = set()
+        for sample in sample_list:
+            for curve_label in self.__supported_curves_sheetname.keys():
+                if curve_label in sample:
+                    label_set.add(curve_label)
+        return([*label_set])
+    
+    def get_temp_range(self, sample_list=None):
+        """Get maximum temperature range of a sample list or of all loaded data"""
+        temp_min = np.min([sample['T'][0] for sample in self.__sample_map])
+        temp_max = np.max([sample['T'][-1] for sample in self.__sample_map])
+        return((temp_min,temp_max))
+    
+    def info(self):
+        """Dump info on current content"""
+        for fi in range(len(self.__filenames)):
+            curve_labels = [*self.__raw_curves[fi].keys()]
+            print("File %2d with %2d samples, %1d curves (%s) and %4d temperature points : \'%s\'" %
+                  (fi, len(self.__raw_curves[fi][curve_labels[0]]), len(self.__raw_curves[fi]), str(curve_labels),
+                   len(self.__raw_temp[fi]), self.__filenames[fi]))
+        return(len(self.__sample_map))
+    
 class Unfold2DModel(lmfit.Model):
     """A 2-dimensional unfolding model that considers denaturant and temperature unfolding simultaneously.
 
